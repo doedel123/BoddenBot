@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Strafrechts-Assistent",
+  title: "Bodden-Bot",
   description: "KI-gestützter Agent für Strafrechtsanalyse mit StGB/StPO-Kommentaren",
 };
 
