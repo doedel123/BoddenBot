@@ -248,7 +248,7 @@ export default function ChatInterface() {
           </div>
           <div>
             <h1 className="text-lg font-bold text-white">Bodden-Bot</h1>
-            <p className="text-xs text-gray-500">GPT-5.4 (medium) &middot; StGB &middot; StPO &middot; Agentic RAG</p>
+            <p className="text-xs text-gray-500">Claude Opus 4.6 &middot; StGB &middot; StPO &middot; Agentic RAG</p>
           </div>
           <div className="ml-auto">
             <button

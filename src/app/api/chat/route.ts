@@ -1,4 +1,5 @@
-import { openai, VECTOR_STORE_ID, MODEL } from "@/lib/openai";
+import { openai, VECTOR_STORE_ID } from "@/lib/openai";
+import { claude, CLAUDE_MODEL } from "@/lib/claude";
 import { SubQuestion, Source } from "@/lib/types";
 
 export const maxDuration = 300;
@@ -12,6 +13,7 @@ function sendEvent(
   controller.enqueue(new TextEncoder().encode(`data: ${payload}\n\n`));
 }
 
+// ── Step 1: Decompose question using Claude ──────────────────────────
 async function decomposeQuestion(
   question: string,
   context: string
@@ -28,23 +30,21 @@ Regeln:
 - Teile in 2-5 Teilfragen auf, wenn die Frage komplex ist
 - NUR bei wirklich einfachen Einzelfragen (ein Paragraph, ein Thema) gib eine einzige Frage zurück
 - Jede Teilfrage muss eigenständig beantwortbar sein und ausreichend Kontext enthalten
-- Antworte mit einem JSON-Objekt: {"questions": ["Frage 1", "Frage 2", ...]}`;
+- Antworte NUR mit einem JSON-Objekt: {"questions": ["Frage 1", "Frage 2", ...]}`;
 
   const userMsg = context
     ? `Kontext aus hochgeladenen Dokumenten:\n${context}\n\nFrage: ${question}`
     : question;
 
-  const response = await openai.chat.completions.create({
-    model: MODEL,
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userMsg },
-    ],
-    temperature: 0.3,
-    response_format: { type: "json_object" },
+  const response = await claude.messages.create({
+    model: CLAUDE_MODEL,
+    max_tokens: 2048,
+    system: systemPrompt,
+    messages: [{ role: "user", content: userMsg }],
   });
 
-  const content = response.choices[0]?.message?.content || "[]";
+  const content =
+    response.content[0].type === "text" ? response.content[0].text : "{}";
   try {
     const parsed = JSON.parse(content);
     const questions = parsed.questions || parsed.sub_questions || parsed;
@@ -54,6 +54,48 @@ Regeln:
   }
 }
 
+// ── Step 2a: Retrieve from OpenAI Vector Store ───────────────────────
+async function retrieveFromVectorStore(
+  question: string
+): Promise<Source[]> {
+  const sources: Source[] = [];
+  try {
+    const response = await openai.responses.create({
+      model: "gpt-4.1-nano",
+      input: question,
+      tools: [
+        {
+          type: "file_search",
+          vector_store_ids: [VECTOR_STORE_ID],
+        },
+      ],
+    });
+
+    const output = response.output;
+    if (output && Array.isArray(output)) {
+      for (const item of output) {
+        if (
+          item.type === "file_search_call" &&
+          "results" in item &&
+          Array.isArray(item.results)
+        ) {
+          for (const result of item.results) {
+            sources.push({
+              type: "vector_store",
+              title: result.filename || "Kommentar",
+              snippet: result.text?.substring(0, 500),
+            });
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Vector store retrieval error:", err);
+  }
+  return sources;
+}
+
+// ── Step 2b: Answer sub-question with Claude + web search ────────────
 async function answerSubQuestion(
   subQ: SubQuestion,
   context: string,
@@ -61,83 +103,78 @@ async function answerSubQuestion(
 ): Promise<SubQuestion> {
   sendEvent(controller, "sub_question_start", { id: subQ.id });
 
-  const sources: Source[] = [];
+  const allSources: Source[] = [];
   let answer = "";
 
   try {
-    const systemPrompt = `Du bist ein hochqualifizierter juristischer Assistent für deutsches Strafrecht. Du hast Zugriff auf StGB- und StPO-Kommentare über den Vector Store sowie Websuche für aktuelle Rechtsprechung.
+    // 2a: Retrieve from vector store
+    const vsSources = await retrieveFromVectorStore(subQ.question);
+    allSources.push(...vsSources);
+
+    // Build context from vector store results
+    const vsContext = vsSources
+      .map((s) => `[${s.title}]: ${s.snippet || ""}`)
+      .join("\n\n");
+
+    // Send vector store sources immediately
+    if (vsSources.length > 0) {
+      sendEvent(controller, "sub_question_sources", {
+        id: subQ.id,
+        sources: vsSources,
+      });
+    }
+
+    const systemPrompt = `Du bist ein hochqualifizierter juristischer Assistent für deutsches Strafrecht.
+Du hast Zugriff auf Websuche für aktuelle Rechtsprechung.
 
 Antworte präzise und fundiert. Zitiere relevante Paragraphen und Kommentarstellen. Nutze Markdown-Formatierung.
+
+${vsContext ? `Ergebnisse aus StGB/StPO-Kommentaren (Vector Store):\n${vsContext}` : ""}
 ${context ? `\nKontext aus hochgeladenen Dokumenten:\n${context}` : ""}`;
 
-    const stream = await openai.responses.create({
-      model: MODEL,
-      instructions: systemPrompt,
-      input: subQ.question,
+    // 2b: Stream answer from Claude with web search + adaptive thinking
+    const stream = claude.messages.stream({
+      model: CLAUDE_MODEL,
+      max_tokens: 16000,
+      thinking: { type: "adaptive" },
+      system: systemPrompt,
+      messages: [{ role: "user", content: subQ.question }],
       tools: [
         {
-          type: "file_search",
-          vector_store_ids: [VECTOR_STORE_ID],
-        },
-        {
-          type: "web_search",
+          type: "web_search_20250305",
+          name: "web_search",
+          max_uses: 3,
         },
       ],
-      reasoning: {
-        effort: "medium",
-      },
-      stream: true,
     });
 
     for await (const event of stream) {
       if (
-        event.type === "response.output_text.delta"
+        event.type === "content_block_delta" &&
+        event.delta.type === "text_delta"
       ) {
-        answer += event.delta;
+        answer += event.delta.text;
         sendEvent(controller, "sub_question_delta", {
           id: subQ.id,
-          delta: event.delta,
+          delta: event.delta.text,
         });
       }
+    }
 
-      // Collect file search sources
-      if (event.type === "response.completed") {
-        const output = event.response?.output;
-        if (output && Array.isArray(output)) {
-          for (const item of output) {
-            if (item.type === "file_search_call" && item.results) {
-              for (const result of item.results) {
-                sources.push({
-                  type: "vector_store",
-                  title: result.filename || "Kommentar",
-                  snippet: result.text?.substring(0, 200),
-                });
-              }
-            }
-            // Web search results are captured via annotations below
-            // Check for message content with annotations
-            if (item.type === "message" && item.content) {
-              for (const block of item.content) {
-                if (block.type === "output_text" && block.annotations) {
-                  for (const ann of block.annotations) {
-                    if (ann.type === "url_citation") {
-                      sources.push({
-                        type: "web_search",
-                        title: ann.title || ann.url,
-                        url: ann.url,
-                      });
-                    }
-                    if (ann.type === "file_citation") {
-                      sources.push({
-                        type: "vector_store",
-                        title: ann.filename || "Kommentar",
-                        snippet: ann.file_id || undefined,
-                      });
-                    }
-                  }
-                }
-              }
-            }
+    // Extract web search citations from final message
+    const finalMessage = await stream.finalMessage();
+    for (const block of finalMessage.content) {
+      if (block.type === "text" && block.citations) {
+        for (const citation of block.citations) {
+          if (
+            citation.type === "web_search_result_location" &&
+            citation.url
+          ) {
+            allSources.push({
+              type: "web_search",
+              title: citation.title || citation.url,
+              url: citation.url,
+            });
           }
         }
       }
@@ -145,8 +182,8 @@ ${context ? `\nKontext aus hochgeladenen Dokumenten:\n${context}` : ""}`;
 
     // Deduplicate sources
     const seen = new Set<string>();
-    const uniqueSources = sources.filter((s) => {
-      const key = s.title + (s.url || "");
+    const uniqueSources = allSources.filter((s) => {
+      const key = s.type + ":" + s.title + (s.url || "");
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
@@ -170,10 +207,16 @@ ${context ? `\nKontext aus hochgeladenen Dokumenten:\n${context}` : ""}`;
       answer: `Fehler: ${errMsg}`,
       error: true,
     });
-    return { ...subQ, status: "error", answer: `Fehler: ${errMsg}`, sources };
+    return {
+      ...subQ,
+      status: "error",
+      answer: `Fehler: ${errMsg}`,
+      sources: allSources,
+    };
   }
 }
 
+// ── Step 3: Synthesize with Claude ───────────────────────────────────
 async function synthesize(
   question: string,
   subResults: SubQuestion[],
@@ -199,29 +242,32 @@ Regeln:
 - Gib eine klare Gesamteinschätzung
 ${context ? `\nKontext aus hochgeladenen Dokumenten:\n${context}` : ""}`;
 
-  const stream = await openai.chat.completions.create({
-    model: MODEL,
+  const stream = claude.messages.stream({
+    model: CLAUDE_MODEL,
+    max_tokens: 16000,
+    thinking: { type: "adaptive" },
+    system: systemPrompt,
     messages: [
-      { role: "system", content: systemPrompt },
       {
         role: "user",
         content: `Ursprüngliche Frage: ${question}\n\nTeilantworten:\n${resultsText}\n\nErstelle eine zusammenfassende Analyse.`,
       },
     ],
-    stream: true,
-    temperature: 0.4,
   });
 
-  for await (const chunk of stream) {
-    const delta = chunk.choices[0]?.delta?.content;
-    if (delta) {
-      sendEvent(controller, "synthesis_delta", { delta });
+  for await (const event of stream) {
+    if (
+      event.type === "content_block_delta" &&
+      event.delta.type === "text_delta"
+    ) {
+      sendEvent(controller, "synthesis_delta", { delta: event.delta.text });
     }
   }
 
   sendEvent(controller, "synthesis_done", {});
 }
 
+// ── Main handler ─────────────────────────────────────────────────────
 export async function POST(req: Request) {
   const body = await req.json();
   const { message, context } = body as {
@@ -265,7 +311,6 @@ export async function POST(req: Request) {
           });
           await synthesize(message, results, context || "", controller);
         } else {
-          // Single question - the sub-question answer IS the final answer
           sendEvent(controller, "synthesis_done", { single: true });
         }
       } catch (error) {
