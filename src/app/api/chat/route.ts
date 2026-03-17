@@ -1,7 +1,7 @@
 import { openai, VECTOR_STORE_ID, MODEL } from "@/lib/openai";
 import { SubQuestion, Source } from "@/lib/types";
 
-export const maxDuration = 120;
+export const maxDuration = 300;
 
 function sendEvent(
   controller: ReadableStreamDefaultController,
