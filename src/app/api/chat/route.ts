@@ -56,9 +56,12 @@ Regeln:
       blocks: response.content.length,
     });
 
-    const content =
+    const raw =
       response.content.find((b) => b.type === "text")?.text ?? "{}";
-    log("DECOMPOSE", "Raw content", content.substring(0, 200));
+    log("DECOMPOSE", "Raw content", raw.substring(0, 200));
+
+    // Strip markdown code fences if present (```json ... ``` or ``` ... ```)
+    const content = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
 
     const parsed = JSON.parse(content);
     const questions = parsed.questions || parsed.sub_questions || parsed;
