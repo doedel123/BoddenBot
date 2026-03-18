@@ -92,6 +92,7 @@ async function retrieveFromVectorStore(
           vector_store_ids: [VECTOR_STORE_ID],
         },
       ],
+      include: ["file_search_call.results"],
     });
 
     const output = response.output;
