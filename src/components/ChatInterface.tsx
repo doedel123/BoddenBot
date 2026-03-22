@@ -6,9 +6,9 @@ import AgentActivityPanel from "./AgentActivityPanel";
 import ThinkingAnimation from "./ThinkingAnimation";
 import VectorStoreManager from "./VectorStoreManager";
 import MemoryDialog from "./MemoryDialog";
-import SaveMemoryButton from "./SaveMemoryButton";
 import MemorySelector from "./MemorySelector";
 import MemoryViewer from "./MemoryViewer";
+import ChatMessage from "./ChatMessage";
 import { useToast } from "./Toast";
 import { SubQuestion, Source, PageIndexDocument } from "@/lib/types";
 
@@ -45,6 +45,13 @@ export default function ChatInterface() {
   const [currentMemoryQuestion, setCurrentMemoryQuestion] = useState("");
   const [currentMemoryAnswer, setCurrentMemoryAnswer] = useState("");
   const { showToast, ToastComponent } = useToast();
+
+  // Memoized handler for saving memories
+  const handleSaveMemory = useCallback((question: string, answer: string) => {
+    setCurrentMemoryQuestion(question);
+    setCurrentMemoryAnswer(answer);
+    setShowMemoryDialog(true);
+  }, []);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -371,32 +378,12 @@ export default function ChatInterface() {
           )}
 
           {messages.map((msg, i) => (
-            <div key={i} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
-              <div
-                className={`max-w-[80%] rounded-2xl px-5 py-3 ${
-                  msg.role === "user"
-                    ? "bg-amber-600 text-white"
-                    : "bg-gray-800 border border-gray-700/50 relative"
-                }`}
-              >
-                {msg.role === "assistant" ? (
-                  <>
-                    <MarkdownRenderer content={msg.content} />
-                    <SaveMemoryButton
-                      question={messages[i - 1]?.content || ""}
-                      answer={msg.content}
-                      onSaveClick={() => {
-                        setCurrentMemoryQuestion(messages[i - 1]?.content || "");
-                        setCurrentMemoryAnswer(msg.content);
-                        setShowMemoryDialog(true);
-                      }}
-                    />
-                  </>
-                ) : (
-                  <p className="whitespace-pre-wrap">{msg.content}</p>
-                )}
-              </div>
-            </div>
+            <ChatMessage
+              key={`${msg.role}-${i}-${msg.content.slice(0, 20)}`}
+              message={msg}
+              previousQuestion={i > 0 ? messages[i - 1]?.content : ""}
+              onSaveClick={handleSaveMemory}
+            />
           ))}
 
           {/* Sub-answers (shown during synthesis) */}
