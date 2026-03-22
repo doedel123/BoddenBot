@@ -5,7 +5,12 @@ import MarkdownRenderer from "./MarkdownRenderer";
 import AgentActivityPanel from "./AgentActivityPanel";
 import ThinkingAnimation from "./ThinkingAnimation";
 import VectorStoreManager from "./VectorStoreManager";
-import { SubQuestion, Source } from "@/lib/types";
+import MemoryDialog from "./MemoryDialog";
+import SaveMemoryButton from "./SaveMemoryButton";
+import MemorySelector from "./MemorySelector";
+import MemoryViewer from "./MemoryViewer";
+import { useToast } from "./Toast";
+import { SubQuestion, Source, PageIndexDocument } from "@/lib/types";
 
 interface Message {
   role: "user" | "assistant";
@@ -27,8 +32,19 @@ export default function ChatInterface() {
   const [showSubAnswers, setShowSubAnswers] = useState(false);
   const [isSynthesizing, setIsSynthesizing] = useState(false);
   const [showVectorStore, setShowVectorStore] = useState(false);
+  const [pageIndexDocs, setPageIndexDocs] = useState<PageIndexDocument[]>([]);
+  const [selectedPageIndexDoc, setSelectedPageIndexDoc] = useState<string>("");
+  const [loadingPageIndexDocs, setLoadingPageIndexDocs] = useState(false);
   const isSingleQuestionRef = useRef(false);
   const finalAnswerRef = useRef("");
+
+  // Memory feature state
+  const [showMemoryDialog, setShowMemoryDialog] = useState(false);
+  const [showMemoryViewer, setShowMemoryViewer] = useState(false);
+  const [memoryViewerCollectionId, setMemoryViewerCollectionId] = useState("");
+  const [currentMemoryQuestion, setCurrentMemoryQuestion] = useState("");
+  const [currentMemoryAnswer, setCurrentMemoryAnswer] = useState("");
+  const { showToast, ToastComponent } = useToast();
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -36,6 +52,27 @@ export default function ChatInterface() {
 
   const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, []);
+
+  // Load PageIndex documents on mount
+  useEffect(() => {
+    async function loadPageIndexDocs() {
+      setLoadingPageIndexDocs(true);
+      try {
+        const res = await fetch("/api/pageindex/documents");
+        const data = await res.json();
+        if (data.documents) {
+          setPageIndexDocs(
+            data.documents.filter((d: PageIndexDocument) => d.status === "completed")
+          );
+        }
+      } catch {
+        // PageIndex not available - that's fine
+      } finally {
+        setLoadingPageIndexDocs(false);
+      }
+    }
+    loadPageIndexDocs();
   }, []);
 
   useEffect(() => {
@@ -98,7 +135,11 @@ export default function ChatInterface() {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: userMessage, context }),
+        body: JSON.stringify({
+          message: userMessage,
+          context,
+          pageIndexDocId: selectedPageIndexDoc || undefined,
+        }),
       });
 
       const reader = res.body?.getReader();
@@ -250,7 +291,33 @@ export default function ChatInterface() {
             <h1 className="text-lg font-bold text-white">Bodden-Bot</h1>
             <p className="text-xs text-gray-500">Claude Opus 4.6 &middot; StGB &middot; StPO &middot; Agentic RAG</p>
           </div>
-          <div className="ml-auto">
+          <div className="ml-auto flex items-center gap-2">
+            {/* PageIndex Document Selector */}
+            {pageIndexDocs.length > 0 && (
+              <div className="relative">
+                <select
+                  value={selectedPageIndexDoc}
+                  onChange={(e) => setSelectedPageIndexDoc(e.target.value)}
+                  className="appearance-none pl-8 pr-8 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 transition-colors border border-gray-700/50 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/50 cursor-pointer"
+                >
+                  <option value="">PageIndex: Kein Dokument</option>
+                  {pageIndexDocs.map((doc) => (
+                    <option key={doc.id} value={doc.id}>
+                      {doc.name} ({doc.pageNum} S.)
+                    </option>
+                  ))}
+                </select>
+                <svg className="w-4 h-4 text-amber-400 absolute left-2 top-1/2 -translate-y-1/2 pointer-events-none" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                </svg>
+                <svg className="w-3 h-3 text-gray-500 absolute right-2.5 top-1/2 -translate-y-1/2 pointer-events-none" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                </svg>
+              </div>
+            )}
+            {loadingPageIndexDocs && (
+              <span className="text-xs text-gray-500">PageIndex laden...</span>
+            )}
             <button
               onClick={() => setShowVectorStore(true)}
               className="flex items-center gap-2 px-3 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-emerald-400 transition-colors border border-gray-700/50 text-sm"
@@ -261,6 +328,12 @@ export default function ChatInterface() {
               </svg>
               Vector Store
             </button>
+            <MemorySelector
+              onViewMemories={(collectionId) => {
+                setMemoryViewerCollectionId(collectionId);
+                setShowMemoryViewer(true);
+              }}
+            />
           </div>
         </header>
 
@@ -303,11 +376,22 @@ export default function ChatInterface() {
                 className={`max-w-[80%] rounded-2xl px-5 py-3 ${
                   msg.role === "user"
                     ? "bg-amber-600 text-white"
-                    : "bg-gray-800 border border-gray-700/50"
+                    : "bg-gray-800 border border-gray-700/50 relative"
                 }`}
               >
                 {msg.role === "assistant" ? (
-                  <MarkdownRenderer content={msg.content} />
+                  <>
+                    <MarkdownRenderer content={msg.content} />
+                    <SaveMemoryButton
+                      question={messages[i - 1]?.content || ""}
+                      answer={msg.content}
+                      onSaveClick={() => {
+                        setCurrentMemoryQuestion(messages[i - 1]?.content || "");
+                        setCurrentMemoryAnswer(msg.content);
+                        setShowMemoryDialog(true);
+                      }}
+                    />
+                  </>
                 ) : (
                   <p className="whitespace-pre-wrap">{msg.content}</p>
                 )}
@@ -435,6 +519,25 @@ export default function ChatInterface() {
         open={showVectorStore}
         onClose={() => setShowVectorStore(false)}
       />
+
+      {/* Memory Dialog */}
+      <MemoryDialog
+        open={showMemoryDialog}
+        onClose={() => setShowMemoryDialog(false)}
+        question={currentMemoryQuestion}
+        answer={currentMemoryAnswer}
+        onSaved={() => showToast("Zu Memory gespeichert ✓", "success")}
+      />
+
+      {/* Memory Viewer */}
+      <MemoryViewer
+        open={showMemoryViewer}
+        onClose={() => setShowMemoryViewer(false)}
+        collectionId={memoryViewerCollectionId}
+      />
+
+      {/* Toast Notifications */}
+      {ToastComponent}
 
       {/* Right Side Panel */}
       <div

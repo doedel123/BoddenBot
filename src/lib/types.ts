@@ -7,10 +7,19 @@ export interface SubQuestion {
 }
 
 export interface Source {
-  type: "vector_store" | "web_search";
+  type: "vector_store" | "web_search" | "page_index";
   title: string;
   url?: string;
   snippet?: string;
+}
+
+export interface PageIndexDocument {
+  id: string;
+  name: string;
+  description: string;
+  status: string;
+  createdAt: string;
+  pageNum: number;
 }
 
 export interface StreamEvent {
@@ -32,4 +41,24 @@ export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   subQuestions?: SubQuestion[];
+}
+
+export interface SavedMemory {
+  id: string;              // UUID
+  collectionId: string;    // Collection reference
+  userQuestion: string;    // Original Frage
+  assistantAnswer: string; // Finale Antwort
+  createdAt: string;       // ISO timestamp
+}
+
+export interface MemoryCollection {
+  id: string;              // UUID
+  name: string;            // "Betrug Fälle", "Notwehr"
+  createdAt: string;       // ISO timestamp
+  updatedAt: string;       // ISO timestamp
+}
+
+export interface MemoryState {
+  collections: MemoryCollection[];
+  activeCollectionId: string | null;
 }

@@ -44,7 +44,8 @@ Regeln:
     : question;
 
   try {
-    const response = await claudeCreate({
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const response: any = await claudeCreate({
       max_tokens: 2048,
       system: systemPrompt,
       messages: [{ role: "user", content: userMsg }],
@@ -57,7 +58,7 @@ Regeln:
     });
 
     const raw =
-      response.content.find((b) => b.type === "text")?.text ?? "{}";
+      response.content.find((b: { type: string }) => b.type === "text")?.text ?? "{}";
     log("DECOMPOSE", "Raw content", raw.substring(0, 200));
 
     // Strip markdown code fences if present (```json ... ``` or ``` ... ```)
@@ -72,6 +73,175 @@ Regeln:
     const msg = err instanceof Error ? err.message : String(err);
     log("DECOMPOSE", "ERROR", msg);
     throw err;
+  }
+}
+
+// ── Step 2a-ii: Retrieve from PageIndex (Tree Search) ───────────────
+const PAGE_INDEX_API_KEY = process.env.PAGE_INDEX_API_KEY;
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+interface TreeNode { title?: string; node_id?: string; page_index?: number; summary?: string; text?: string; nodes?: TreeNode[] }
+
+/** Flatten tree into a compact summary string for the LLM */
+function flattenTree(nodes: TreeNode[], depth = 0): string {
+  const lines: string[] = [];
+  for (const n of nodes) {
+    const indent = "  ".repeat(depth);
+    const pages = n.page_index ? ` [S.${n.page_index}]` : "";
+    const summary = n.summary ? ` — ${n.summary.substring(0, 120)}` : "";
+    lines.push(`${indent}- ${n.node_id || "?"}: ${n.title || "Ohne Titel"}${pages}${summary}`);
+    if (n.nodes?.length) {
+      lines.push(flattenTree(n.nodes, depth + 1));
+    }
+  }
+  return lines.join("\n");
+}
+
+/** Step 1: Get document tree structure with summaries */
+async function getDocumentTree(docId: string, id: string): Promise<TreeNode[]> {
+  log("PAGEINDEX", `[${id}] Fetching tree for ${docId}`);
+  const res = await fetch(
+    `https://api.pageindex.ai/doc/${docId}/?type=tree&summary=true`,
+    { headers: { api_key: PAGE_INDEX_API_KEY! } }
+  );
+  if (!res.ok) {
+    log("PAGEINDEX", `[${id}] Tree fetch failed: ${res.status}`);
+    return [];
+  }
+  const data = await res.json();
+  // Tree is in data.result or data directly
+  const tree = data.result?.nodes || data.result || data.nodes || [];
+  log("PAGEINDEX", `[${id}] Tree fetched, ${Array.isArray(tree) ? tree.length : 0} top-level nodes`);
+  return tree;
+}
+
+/** Step 2: Use Claude to identify relevant nodes via LLM tree search */
+async function findRelevantNodes(
+  question: string,
+  tree: TreeNode[],
+  id: string
+): Promise<{ nodeIds: string[]; pageIndices: number[] }> {
+  const treeStr = flattenTree(tree);
+  // Truncate if tree is very large (keep under ~12k chars for the LLM)
+  const truncatedTree = treeStr.length > 12000 ? treeStr.substring(0, 12000) + "\n... (gekürzt)" : treeStr;
+
+  log("PAGEINDEX", `[${id}] LLM tree search, tree size: ${treeStr.length} chars`);
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const response: any = await claudeCreate({
+    max_tokens: 1024,
+    system: `Du analysierst Dokumentstrukturen und findest relevante Abschnitte. Antworte NUR mit JSON.`,
+    messages: [{
+      role: "user",
+      content: `Frage: ${question}\n\nDokument-Struktur:\n${truncatedTree}\n\nWelche Nodes enthalten wahrscheinlich die Antwort? Antworte als JSON:\n{"thinking": "kurze Begründung", "node_list": ["node_id1", "node_id2", ...]}`,
+    }],
+  });
+
+  const raw = response.content.find((b: { type: string }) => b.type === "text")?.text ?? "{}";
+  const content = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+
+  try {
+    const parsed = JSON.parse(content);
+    const nodeIds: string[] = parsed.node_list || [];
+    log("PAGEINDEX", `[${id}] LLM selected ${nodeIds.length} nodes: ${nodeIds.join(", ")}`);
+
+    // Collect page indices from selected nodes
+    const pageIndices = new Set<number>();
+    function collectPages(nodes: TreeNode[]) {
+      for (const n of nodes) {
+        if (n.node_id && nodeIds.includes(n.node_id) && n.page_index) {
+          // Add the page and a few surrounding pages for context
+          for (let p = Math.max(1, n.page_index - 1); p <= n.page_index + 2; p++) {
+            pageIndices.add(p);
+          }
+        }
+        if (n.nodes) collectPages(n.nodes);
+      }
+    }
+    collectPages(tree);
+
+    return { nodeIds, pageIndices: Array.from(pageIndices).sort((a, b) => a - b).slice(0, 15) };
+  } catch {
+    log("PAGEINDEX", `[${id}] Failed to parse LLM response`);
+    return { nodeIds: [], pageIndices: [] };
+  }
+}
+
+/** Step 3: Get OCR page content for specific pages */
+async function getPageContent(
+  docId: string,
+  pageIndices: number[],
+  id: string
+): Promise<string> {
+  if (pageIndices.length === 0) return "";
+
+  log("PAGEINDEX", `[${id}] Fetching ${pageIndices.length} pages: ${pageIndices.join(",")}`);
+  const res = await fetch(
+    `https://api.pageindex.ai/doc/${docId}/?type=ocr&format=page`,
+    { headers: { api_key: PAGE_INDEX_API_KEY! } }
+  );
+  if (!res.ok) {
+    log("PAGEINDEX", `[${id}] OCR fetch failed: ${res.status}`);
+    return "";
+  }
+
+  const data = await res.json();
+  const pages = data.result || data.pages || data;
+
+  if (!Array.isArray(pages)) return "";
+
+  // Filter to only requested pages
+  const pageSet = new Set(pageIndices);
+  const relevant = pages
+    .filter((p: { page_index?: number }) => p.page_index && pageSet.has(p.page_index))
+    .map((p: { page_index?: number; markdown?: string }) => `[Seite ${p.page_index}]\n${p.markdown || ""}`)
+    .join("\n\n---\n\n");
+
+  log("PAGEINDEX", `[${id}] Got ${relevant.length} chars of page content`);
+  return relevant;
+}
+
+/** Orchestrate the full PageIndex tree search retrieval */
+async function retrieveFromPageIndex(
+  question: string,
+  docId: string,
+  id: string
+): Promise<{ sources: Source[]; context: string }> {
+  log("PAGEINDEX", `[${id}] Starting tree search for doc ${docId}`);
+  if (!PAGE_INDEX_API_KEY) {
+    log("PAGEINDEX", `[${id}] No API key configured`);
+    return { sources: [], context: "" };
+  }
+
+  try {
+    // Step 1: Get document tree
+    const tree = await getDocumentTree(docId, id);
+    if (tree.length === 0) {
+      return { sources: [], context: "" };
+    }
+
+    // Step 2: LLM identifies relevant nodes
+    const { nodeIds, pageIndices } = await findRelevantNodes(question, tree, id);
+    if (pageIndices.length === 0) {
+      log("PAGEINDEX", `[${id}] No relevant pages found`);
+      return { sources: [], context: "" };
+    }
+
+    // Step 3: Fetch targeted page content
+    const pageContent = await getPageContent(docId, pageIndices, id);
+
+    const sources: Source[] = pageIndices.map((p) => ({
+      type: "page_index" as const,
+      title: `PageIndex S. ${p}`,
+      snippet: `Node(s): ${nodeIds.join(", ")}`,
+    }));
+
+    log("PAGEINDEX", `[${id}] Tree search complete: ${sources.length} sources, ${pageContent.length} chars context`);
+    return { sources, context: pageContent };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log("PAGEINDEX", `[${id}] ERROR: ${msg}`);
+    return { sources: [], context: "" };
   }
 }
 
@@ -126,7 +296,8 @@ async function retrieveFromVectorStore(
 async function answerSubQuestion(
   subQ: SubQuestion,
   context: string,
-  controller: ReadableStreamDefaultController
+  controller: ReadableStreamDefaultController,
+  pageIndexDocId?: string
 ): Promise<SubQuestion> {
   sendEvent(controller, "sub_question_start", { id: subQ.id });
   log("SUB", `[${subQ.id}] Starting: "${subQ.question.substring(0, 60)}..."`);
@@ -150,12 +321,29 @@ async function answerSubQuestion(
       });
     }
 
+    // 2a-ii: Retrieve from PageIndex (if document selected)
+    let piContext = "";
+    if (pageIndexDocId) {
+      const piResult = await retrieveFromPageIndex(subQ.question, pageIndexDocId, subQ.id);
+      allSources.push(...piResult.sources);
+      if (piResult.context) {
+        piContext = piResult.context;
+      }
+      if (piResult.sources.length > 0) {
+        sendEvent(controller, "sub_question_sources", {
+          id: subQ.id,
+          sources: piResult.sources,
+        });
+      }
+    }
+
     const systemPrompt = `Du bist ein hochqualifizierter juristischer Assistent für deutsches Strafrecht.
 Du hast Zugriff auf Websuche für aktuelle Rechtsprechung.
 
 Antworte präzise und fundiert. Zitiere relevante Paragraphen und Kommentarstellen. Nutze Markdown-Formatierung.
 
 ${vsContext ? `Ergebnisse aus StGB/StPO-Kommentaren (Vector Store):\n${vsContext}` : ""}
+${piContext ? `\nErgebnisse aus PageIndex-Dokumentanalyse:\n${piContext}` : ""}
 ${context ? `\nKontext aus hochgeladenen Dokumenten:\n${context}` : ""}`;
 
     log("SUB", `[${subQ.id}] Calling Claude streaming`);
@@ -172,7 +360,8 @@ ${context ? `\nKontext aus hochgeladenen Dokumenten:\n${context}` : ""}`;
           max_uses: 3,
         },
       ],
-    } as Parameters<typeof claude.messages.stream>[0]);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any);
 
     let eventCount = 0;
     for await (const event of stream) {
@@ -328,9 +517,10 @@ ${context ? `\nKontext aus hochgeladenen Dokumenten:\n${context}` : ""}`;
 // ── Main handler ─────────────────────────────────────────────────────
 export async function POST(req: Request) {
   const body = await req.json();
-  const { message, context } = body as {
+  const { message, context, pageIndexDocId } = body as {
     message: string;
     context?: string;
+    pageIndexDocId?: string;
   };
 
   log("MAIN", `New request: "${message.substring(0, 80)}"`);
@@ -357,7 +547,7 @@ export async function POST(req: Request) {
 
         const results = await Promise.all(
           subQuestions.map((sq) =>
-            answerSubQuestion(sq, context || "", controller)
+            answerSubQuestion(sq, context || "", controller, pageIndexDocId)
           )
         );
 
