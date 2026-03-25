@@ -4,6 +4,38 @@ import { SubQuestion, Source } from "@/lib/types";
 
 export const maxDuration = 300;
 
+/**
+ * Robust JSON extraction from Claude responses.
+ * Handles: pure JSON, code-fenced JSON, JSON with text before/after.
+ */
+function extractJSON(raw: string): Record<string, unknown> {
+  const trimmed = raw.trim();
+
+  // 1) Try direct parse
+  try { return JSON.parse(trimmed); } catch { /* continue */ }
+
+  // 2) Try extracting from ```json ... ``` code fences
+  const fenceMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenceMatch) {
+    try { return JSON.parse(fenceMatch[1].trim()); } catch { /* continue */ }
+  }
+
+  // 3) Find first { and match its closing } via bracket counting
+  const start = trimmed.indexOf("{");
+  if (start !== -1) {
+    let depth = 0;
+    for (let i = start; i < trimmed.length; i++) {
+      if (trimmed[i] === "{") depth++;
+      else if (trimmed[i] === "}") depth--;
+      if (depth === 0) {
+        try { return JSON.parse(trimmed.slice(start, i + 1)); } catch { break; }
+      }
+    }
+  }
+
+  throw new Error(`Could not extract JSON from response: ${trimmed.substring(0, 100)}...`);
+}
+
 function log(step: string, msg: string, data?: unknown) {
   const ts = new Date().toISOString().slice(11, 23);
   console.log(`[${ts}] [${step}] ${msg}`, data !== undefined ? data : "");
@@ -61,10 +93,7 @@ Regeln:
       response.content.find((b: { type: string }) => b.type === "text")?.text ?? "{}";
     log("DECOMPOSE", "Raw content", raw.substring(0, 200));
 
-    // Strip markdown code fences if present (```json ... ``` or ``` ... ```)
-    const content = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
-
-    const parsed = JSON.parse(content);
+    const parsed = extractJSON(raw);
     const questions = parsed.questions || parsed.sub_questions || parsed;
     const result = Array.isArray(questions) ? questions : [question];
     log("DECOMPOSE", `Decomposed into ${result.length} sub-questions`, result);
@@ -138,11 +167,10 @@ async function findRelevantNodes(
   });
 
   const raw = response.content.find((b: { type: string }) => b.type === "text")?.text ?? "{}";
-  const content = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
 
   try {
-    const parsed = JSON.parse(content);
-    const nodeIds: string[] = parsed.node_list || [];
+    const parsed = extractJSON(raw);
+    const nodeIds: string[] = (parsed.node_list as string[]) || [];
     log("PAGEINDEX", `[${id}] LLM selected ${nodeIds.length} nodes: ${nodeIds.join(", ")}`);
 
     // Collect page indices from selected nodes
